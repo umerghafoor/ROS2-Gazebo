@@ -309,12 +309,19 @@ spawn_terminal() {
 
     if have_sudo_user; then
         # Re-elevate inside the terminal so `docker exec` etc. work.
-        # `sudo -E` preserves the env; `bash -lc` runs as a login shell so
-        # /opt/ros/setup.bash etc. get sourced normally (in case the user
-        # later types non-docker commands).
-        payload="sudo -E bash -lc $(printf '%q' "${cmd_str}"); exec sudo -E bash -l"
+        # Pass DISPLAY/XAUTHORITY explicitly via sudo VAR=val syntax —
+        # some sudoers policies reject `-E` (env_keep is the standard way).
+        # If the inner command fails, leave a clearly-labeled host shell
+        # behind so the user can debug (instead of a bare # prompt that
+        # looks like it's inside the container).
+        local sudo_env
+        sudo_env="DISPLAY=$(printf '%q' "${DISPLAY:-:0}") "
+        sudo_env+="XAUTHORITY=$(printf '%q' "${XAUTHORITY:-/tmp/.docker.xauth}")"
+        payload="sudo ${sudo_env} bash -lc $(printf '%q' "${cmd_str}") "
+        payload+="|| echo '[ros2gz] command failed — dropping to host shell for debugging'; "
+        payload+="exec sudo PS1='(host-root) \\w # ' bash"
     else
-        payload="${cmd_str}; exec bash"
+        payload="${cmd_str} || echo '[ros2gz] command failed'; exec bash"
     fi
 
     case "${term}" in
@@ -393,12 +400,24 @@ cmd_term() {
     open_in_terminal docker exec -it "${CONTAINER_NAME}" bash
 }
 
+# `docker exec` runs commands with a minimal PATH that doesn't include
+# /opt/ros/${ROS_DISTRO}/bin. Ubuntu's default .bashrc bails out for
+# non-interactive shells before sourcing anything, so `bash -lc` alone
+# isn't enough. We explicitly source the ROS setup (and the workspace
+# overlay if present) inside every non-interactive exec.
+
+# Prelude sourced inside the container before each command we run.
+ROS_PRELUDE='source /opt/ros/${ROS_DISTRO}/setup.bash 2>/dev/null;
+[ -f /home/ros/ros2_ws/install/setup.bash ] && source /home/ros/ros2_ws/install/setup.bash 2>/dev/null;
+true'
+
 cmd_gazebo() {
     local world="${1:-shapes.sdf}"
     "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
     ensure_running
     log "Launching Gazebo (world=${world})"
-    open_in_terminal docker exec -it "${CONTAINER_NAME}" gz sim -v 4 "${world}"
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" \
+        bash -c "${ROS_PRELUDE}; exec gz sim -v 4 $(printf '%q' "${world}")"
 }
 
 cmd_rviz() {
@@ -406,25 +425,37 @@ cmd_rviz() {
     "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
     ensure_running
     log "Launching RViz2"
-    open_in_terminal docker exec -it "${CONTAINER_NAME}" rviz2 -d "${cfg}"
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" \
+        bash -c "${ROS_PRELUDE}; exec rviz2 -d $(printf '%q' "${cfg}")"
 }
 
 cmd_gz_rviz() {
     "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
     ensure_running
     log "Launching Gazebo + bridge + RViz"
+    local extra=""
+    for a in "$@"; do extra+=" $(printf '%q' "${a}")"; done
     open_in_terminal docker exec -it "${CONTAINER_NAME}" \
-        ros2 launch /home/ros/.config/ros2-gazeebo/launch/gz_rviz.launch.py "$@"
+        bash -c "${ROS_PRELUDE}; exec ros2 launch /home/ros/.config/ros2-gazeebo/launch/gz_rviz.launch.py${extra}"
 }
 
-cmd_ros2()    { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 "$@"; }
+_in() {
+    # Run "$@" inside the container with the ROS overlay explicitly sourced.
+    ensure_running
+    local cmd=""
+    local a
+    for a in "$@"; do cmd+=" $(printf '%q' "${a}")"; done
+    docker exec -it "${CONTAINER_NAME}" bash -c "${ROS_PRELUDE}; exec${cmd}"
+}
+
+cmd_ros2()    { _in ros2 "$@"; }
 cmd_exec()    {
     if [ "$#" -eq 0 ]; then err "Usage: ./ros2gz exec <command> [args...]"; exit 1; fi
-    ensure_running; docker exec -it "${CONTAINER_NAME}" "$@";
+    _in "$@";
 }
-cmd_topics()  { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 topic list; }
-cmd_nodes()   { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 node list;  }
-cmd_doctor()  { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 doctor;     }
+cmd_topics()  { _in ros2 topic list; }
+cmd_nodes()   { _in ros2 node list;  }
+cmd_doctor()  { _in ros2 doctor;     }
 
 cmd_build_ws() {
     ensure_running
