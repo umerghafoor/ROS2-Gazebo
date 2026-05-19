@@ -90,6 +90,9 @@ RUN rosdep update \
     && echo "[ -f /home/${USERNAME}/ros2_ws/install/setup.bash ] && source /home/${USERNAME}/ros2_ws/install/setup.bash" >> /home/${USERNAME}/.bashrc \
     && echo "export GZ_VERSION=${GZ_DISTRO}" >> /home/${USERNAME}/.bashrc
 
+COPY --chown=${USERNAME}:${USERNAME} config/default.rviz /home/${USERNAME}/.rviz2/default.rviz
+COPY --chown=${USERNAME}:${USERNAME} config/launch/ /home/${USERNAME}/.config/ros2-gazeebo/launch/
+
 COPY --chown=${USERNAME}:${USERNAME} docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 USER root
 RUN chmod +x /usr/local/bin/entrypoint.sh

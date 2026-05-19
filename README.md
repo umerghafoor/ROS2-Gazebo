@@ -36,7 +36,7 @@ inside a container, while still letting you:
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/ROS2-Gazeebo.git
+git clone https://github.com/umerghafoor/ROS2-Gazeebo.git
 cd ROS2-Gazeebo
 
 # 1. Build the image (~10–15 min the first time, mostly downloads)
@@ -71,6 +71,8 @@ All scripts live in [scripts/](scripts/) and are safe to inspect / hack on.
 | [setup_x11.sh](scripts/setup_x11.sh)  | Configure X11 forwarding (xhost + xauth cookie). Called by `run.sh`, but you can run it standalone too. |
 | [shell.sh](scripts/shell.sh)          | Open another bash session in the running container.              |
 | [demo.sh](scripts/demo.sh)            | End-to-end sanity check — launches Gazebo with `shapes.sdf`.     |
+| [rviz.sh](scripts/rviz.sh)            | Launch RViz2 (attaches to the running container if one exists).  |
+| [gz_rviz.sh](scripts/gz_rviz.sh)      | Launch Gazebo + ros_gz bridge + RViz together via a launch file. |
 | [stop.sh](scripts/stop.sh)            | Stop & remove the container.                                     |
 | [clean.sh](scripts/clean.sh)          | Stop the container and delete the image.                         |
 | [common.sh](scripts/common.sh)        | Shared variables and helpers sourced by the others.              |
@@ -146,6 +148,66 @@ To force CPU / software rendering (useful for debugging):
 
 If you're on AMD or Intel graphics, the script falls back to
 `--device /dev/dri:/dev/dri`, which is enough for Mesa-based OpenGL.
+
+---
+
+## RViz2 integration
+
+RViz2 is preinstalled in the image (`ros-${ROS_DISTRO}-rviz2`) and a default
+config ships at [config/default.rviz](config/default.rviz) — it's baked into
+the image at `/home/ros/.rviz2/default.rviz` with TF, Grid, RobotModel,
+LaserScan, PointCloud2 and Image displays already wired up (the data ones
+start disabled — enable them once you publish the matching topics).
+
+### Just RViz
+
+```bash
+./scripts/rviz.sh                          # default config
+./scripts/rviz.sh -d /path/in/container    # custom config
+make rviz
+```
+
+If a `ros2-gazebo` container is already running (e.g. you started Gazebo
+in another terminal), `rviz.sh` exec's RViz inside it so they share the
+same `ROS_DOMAIN_ID` and DDS discovery — no extra setup needed.
+
+### Gazebo + ros_gz bridge + RViz together
+
+```bash
+./scripts/gz_rviz.sh                                          # shapes.sdf
+./scripts/gz_rviz.sh world:=empty.sdf                         # different world
+./scripts/gz_rviz.sh bridge:='/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist'
+make gz-rviz
+```
+
+This runs the bundled launch file
+[config/launch/gz_rviz.launch.py](config/launch/gz_rviz.launch.py), which:
+
+1. Starts `gz sim -r` with the given world
+2. Bridges `/clock` (`gz.msgs.Clock` ↔ `rosgraph_msgs/msg/Clock`) so
+   `use_sim_time` works
+3. Optionally bridges any extra topics you pass via `bridge:=...`
+4. Launches RViz2 with `use_sim_time: true` and the default config
+
+To verify it's working, in another terminal:
+
+```bash
+./scripts/shell.sh
+ros2 topic list                  # should include /clock + your extras
+ros2 topic echo /clock --once    # should print a sim time
+```
+
+### Customizing the RViz config
+
+The default config is just a starting point. To make your own permanent:
+
+1. Open RViz, add/configure displays.
+2. **File → Save Config As…** to a path under
+   `~/ros2_ws/...` (host-mounted, persists across container restarts).
+3. Next time: `./scripts/rviz.sh -d /home/ros/ros2_ws/your.rviz`.
+
+Or edit [config/default.rviz](config/default.rviz) on the host and
+`./scripts/build.sh` to bake it into the image.
 
 ---
 
@@ -238,10 +300,29 @@ Toolkit needs updating or doesn't match your host driver version.
 <details>
 <summary><strong>"Got permission denied while trying to connect to the Docker daemon"</strong></summary>
 
-Add your user to the docker group (logout/login afterwards):
+Add your user to the docker group (logout/login or `newgrp docker` afterwards):
 ```bash
 sudo usermod -aG docker $USER
+newgrp docker
 ```
+</details>
+
+<details>
+<summary><strong>"BuildKit is enabled but the buildx component is missing or broken"</strong></summary>
+
+Ubuntu's `docker.io` package ships Docker without the `buildx` plugin.
+`scripts/build.sh` detects this and falls back to the legacy builder
+automatically. If you want BuildKit's speed/cache benefits:
+
+```bash
+sudo apt install docker-buildx        # Ubuntu 24.04+
+# or, on systems with Docker's own repo:
+sudo apt install docker-buildx-plugin
+```
+
+Or install Docker from
+[Docker's official repository](https://docs.docker.com/engine/install/ubuntu/),
+which bundles buildx.
 </details>
 
 <details>
@@ -276,9 +357,15 @@ ROS2-Gazeebo/
 │   ├── setup_x11.sh
 │   ├── shell.sh
 │   ├── demo.sh
+│   ├── rviz.sh             # launch RViz2 (attaches to running container)
+│   ├── gz_rviz.sh          # Gazebo + bridge + RViz via launch file
 │   ├── stop.sh
 │   ├── clean.sh
 │   └── common.sh
+├── config/
+│   ├── default.rviz        # default RViz layout (TF, Grid, common displays)
+│   └── launch/
+│       └── gz_rviz.launch.py
 ├── workspace/              # bind-mounted into the container as ~/ros2_ws
 ├── docker-compose.yml
 ├── Makefile
