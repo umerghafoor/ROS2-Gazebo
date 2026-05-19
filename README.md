@@ -1,9 +1,33 @@
 # ROS2-Gazeebo
 
+> **ROS 2 + Gazebo in Docker with GUI, GPU support, and a persistent
+> workspace — no host setup required.**
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![ROS 2 Jazzy](https://img.shields.io/badge/ROS_2-Jazzy-22314E?logo=ros&logoColor=white)](https://docs.ros.org/en/jazzy/)
+[![Gazebo Harmonic](https://img.shields.io/badge/Gazebo-Harmonic-FF6B00)](https://gazebosim.org/docs/harmonic/)
+[![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-E95420?logo=ubuntu&logoColor=white)](https://releases.ubuntu.com/24.04/)
+[![Docker](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+
 A reproducible **Docker image** and helper scripts for running
 [ROS 2](https://docs.ros.org/) with [Gazebo](https://gazebosim.org/) on
 Linux — including X11 forwarding for GUI tools (Gazebo, RViz, rqt) and
-optional NVIDIA GPU acceleration.
+optional NVIDIA GPU acceleration. A single launcher script (`./ros2gz`)
+gives you an interactive menu and shortcut subcommands for everything
+without ever typing `docker exec` yourself.
+
+## Features
+
+- 🐳 Single-command Docker image with ROS 2 Jazzy + Gazebo Harmonic
+- 🖥️ X11 forwarding pre-wired — Gazebo, RViz, rqt open as regular windows
+- 🎮 Auto-detected NVIDIA GPU acceleration (CPU fallback otherwise)
+- 📁 Bind-mounted `workspace/` so your code persists; mount extra folders
+  on the fly with `./ros2gz --mount ~/my_pkg`
+- 🚀 `./ros2gz` launcher: interactive menu **or** scriptable subcommands,
+  opens GUIs in new terminal windows automatically
+- 🤖 Bundled RViz config + ros_gz bridge launch file for instant sim ↔ ROS
+- 🔧 Parameterized Dockerfile — swap to Humble + Fortress with one
+  build-arg change
 
 Default stack:
 
@@ -87,6 +111,34 @@ menu; with a subcommand it just does the thing:
 It auto-detects whether a container is running, starts a detached one if
 needed, wires up X11 before launching GUI apps, and reuses the same
 container for every command so everything shares one ROS DDS domain.
+
+GUI apps and shells open in a **new terminal window** (gnome-terminal /
+konsole / alacritty / xterm — whichever is installed). Pass `--inline`
+to keep them in the current terminal instead.
+
+#### Mounting extra host folders
+
+You can bind-mount any host folder into the container without editing
+the Dockerfile or compose file:
+
+```bash
+./ros2gz --mount ~/my_pkg shell      # prompts for container path, then opens shell
+./ros2gz --here gazebo               # shortcut for --mount $PWD
+./ros2gz --mount ~/data:/data shell  # explicit container path, no prompt
+```
+
+Or interactively: pick "16) Add a folder mount" in the menu. You'll be
+asked whether to **save it permanently** — saved mounts go to
+`.ros2gz.mounts` (gitignored, per-user) and auto-apply every time the
+container starts. Manage them via menu options 16–18 or:
+
+```bash
+./ros2gz mounts                       # list saved + ad-hoc mounts
+```
+
+Note: Docker can't add mounts to a *running* container. If you add a
+mount while one is up, `ros2gz` will warn and transparently restart it
+so the new mount takes effect.
 
 ---
 

@@ -3,137 +3,366 @@
 #
 # Run with no args for an interactive menu, or pass a subcommand:
 #
-#   ./ros2gz                # interactive menu
-#   ./ros2gz shell          # open bash inside the container
-#   ./ros2gz term           # open another bash in the running container
-#   ./ros2gz gazebo [WORLD] # launch Gazebo (default: shapes.sdf)
-#   ./ros2gz rviz [CONFIG]  # launch RViz2
-#   ./ros2gz gz-rviz        # Gazebo + bridge + RViz together
-#   ./ros2gz demo           # same as gazebo with shapes.sdf
-#   ./ros2gz ros2 ARGS...   # run a ros2 CLI command (e.g. ros2 topic list)
-#   ./ros2gz exec CMD...    # run any command in the container
-#   ./ros2gz topics         # quick ros2 topic list
-#   ./ros2gz nodes          # quick ros2 node list
-#   ./ros2gz doctor         # ros2 doctor
-#   ./ros2gz build-ws       # colcon build inside the container
-#   ./ros2gz logs           # tail container logs
-#   ./ros2gz status         # show whether the container is running
-#   ./ros2gz up             # start a detached container (no GUI)
-#   ./ros2gz stop           # stop & remove the container
-#   ./ros2gz rebuild        # rebuild the docker image
-#   ./ros2gz clean          # remove image (and stop container)
-#   ./ros2gz help           # show this help
+#   ./ros2gz                       # interactive menu
+#   ./ros2gz shell                 # open bash in a new terminal window
+#   ./ros2gz term                  # open another bash in a new window
+#   ./ros2gz gazebo [WORLD]        # launch Gazebo (default: shapes.sdf)
+#   ./ros2gz rviz [CONFIG]         # launch RViz2
+#   ./ros2gz gz-rviz               # Gazebo + bridge + RViz together
+#   ./ros2gz demo                  # same as gazebo with shapes.sdf
+#   ./ros2gz ros2 ARGS...          # run a ros2 CLI command
+#   ./ros2gz exec CMD...           # run any command in the container
+#   ./ros2gz topics                # quick ros2 topic list
+#   ./ros2gz nodes                 # quick ros2 node list
+#   ./ros2gz doctor                # ros2 doctor
+#   ./ros2gz build-ws              # colcon build inside the container
+#   ./ros2gz logs                  # tail container logs
+#   ./ros2gz status                # show container/image status
+#   ./ros2gz up                    # start a detached container (no GUI)
+#   ./ros2gz stop                  # stop & remove the container
+#   ./ros2gz rebuild               # rebuild the docker image
+#   ./ros2gz clean                 # remove image (and stop container)
+#   ./ros2gz mounts                # list extra mounts configured
+#   ./ros2gz help                  # show this help
+#
+# Flags (must come BEFORE the subcommand):
+#   --mount HOST_PATH[:CONTAINER_PATH]   add an extra bind mount and restart
+#                                        the container so it takes effect.
+#                                        Repeatable. If CONTAINER_PATH is
+#                                        omitted you'll be prompted.
+#   --here                               shortcut for --mount $PWD
+#   --inline                             open shells inline (no new terminal)
+#   --terminal CMD                       force a specific terminal emulator
 
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROS2GZ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/common.sh
-source "${SCRIPT_DIR}/scripts/common.sh"
+source "${ROS2GZ_ROOT}/scripts/common.sh"
+# common.sh sets SCRIPT_DIR to its own location (scripts/) and
+# PROJECT_ROOT to the repo root. Use PROJECT_ROOT here to be unambiguous.
+SCRIPTS_DIR="${PROJECT_ROOT}/scripts"
 
+EXTRA_MOUNTS_FILE="${PROJECT_ROOT}/.ros2gz.mounts"
+OPEN_INLINE=0
+FORCED_TERMINAL=""
+declare -a ADHOC_MOUNTS=()
+
+# ---------------------------------------------------------------------------
+# Flag parsing (consumes flags before the subcommand)
+# ---------------------------------------------------------------------------
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --mount)
+            [ -n "${2:-}" ] || { err "--mount requires HOST_PATH[:CONTAINER_PATH]"; exit 1; }
+            ADHOC_MOUNTS+=("$2"); shift 2;;
+        --here)
+            ADHOC_MOUNTS+=("$(pwd)"); shift;;
+        --inline)
+            OPEN_INLINE=1; shift;;
+        --terminal)
+            [ -n "${2:-}" ] || { err "--terminal requires a command"; exit 1; }
+            FORCED_TERMINAL="$2"; shift 2;;
+        --) shift; break;;
+        *) break;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Mount handling
+# ---------------------------------------------------------------------------
+# Mount spec format: HOST_PATH:CONTAINER_PATH
+# - Saved persistently in .ros2gz.mounts (one per line)
+# - Ad-hoc mounts from --mount applied on top of saved ones for this invocation
+
+resolve_mount() {
+    # Parse a HOST[:CONTAINER] spec, prompt for CONTAINER if missing,
+    # echo the resolved "HOST:CONTAINER" to stdout.
+    local spec="$1"
+    local host_path container_path
+    if [[ "${spec}" == *:* ]]; then
+        host_path="${spec%%:*}"
+        container_path="${spec#*:}"
+    else
+        host_path="${spec}"
+        container_path=""
+    fi
+    # Expand ~ and make absolute.
+    host_path="${host_path/#\~/${HOME}}"
+    host_path="$(cd "${host_path}" 2>/dev/null && pwd || echo "${host_path}")"
+    if [ ! -e "${host_path}" ]; then
+        err "Host path does not exist: ${host_path}"
+        return 1
+    fi
+    if [ -z "${container_path}" ]; then
+        local base; base="$(basename "${host_path}")"
+        local default="/home/ros/mounts/${base}"
+        printf "Container path for %s [%s]: " "${host_path}" "${default}" >&2
+        read -r container_path </dev/tty || true
+        container_path="${container_path:-${default}}"
+    fi
+    echo "${host_path}:${container_path}"
+}
+
+saved_mounts() {
+    [ -f "${EXTRA_MOUNTS_FILE}" ] || return 0
+    grep -vE '^\s*(#|$)' "${EXTRA_MOUNTS_FILE}" || true
+}
+
+all_mounts() {
+    # Merge saved + ad-hoc into a single list, de-duped on host path.
+    {
+        saved_mounts
+        printf '%s\n' "${ADHOC_MOUNTS[@]:-}" | grep -v '^$' || true
+    } | awk -F: 'NF && !seen[$1]++'
+}
+
+persist_mount() {
+    local resolved="$1"
+    mkdir -p "$(dirname "${EXTRA_MOUNTS_FILE}")"
+    touch "${EXTRA_MOUNTS_FILE}"
+    if ! grep -Fxq "${resolved}" "${EXTRA_MOUNTS_FILE}"; then
+        echo "${resolved}" >> "${EXTRA_MOUNTS_FILE}"
+        ok "Saved mount: ${resolved}"
+    else
+        log "Mount already saved: ${resolved}"
+    fi
+}
+
+# Resolve ad-hoc mount specs once up-front so we prompt the user before
+# anything else happens.
+declare -a RESOLVED_ADHOC=()
+for spec in "${ADHOC_MOUNTS[@]:-}"; do
+    [ -z "${spec}" ] && continue
+    resolved="$(resolve_mount "${spec}")" || exit 1
+    RESOLVED_ADHOC+=("${resolved}")
+done
+ADHOC_MOUNTS=("${RESOLVED_ADHOC[@]}")
+
+extra_mount_args() {
+    # Echo `-v host:container` args, one mount per pair, NUL-safe via printf.
+    local m host container
+    while IFS= read -r m; do
+        [ -z "${m}" ] && continue
+        host="${m%%:*}"
+        container="${m#*:}"
+        printf '%s\0%s:%s\0' "-v" "${host}" "${container}"
+    done < <(all_mounts)
+}
+
+# ---------------------------------------------------------------------------
+# Container lifecycle
+# ---------------------------------------------------------------------------
 container_running() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"
 }
 
+current_mounts_match() {
+    # Return 0 if the running container already has all requested mounts.
+    local running_mounts wanted
+    running_mounts="$(docker inspect "${CONTAINER_NAME}" \
+        --format '{{range .Mounts}}{{.Source}}:{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)"
+    while IFS= read -r wanted; do
+        [ -z "${wanted}" ] && continue
+        grep -Fxq "${wanted}" <<<"${running_mounts}" || return 1
+    done < <(all_mounts)
+    return 0
+}
+
+start_detached() {
+    # Build the docker run command via run.sh, plus extra mounts.
+    local -a extra=()
+    while IFS= read -r -d '' item; do
+        extra+=("${item}")
+    done < <(extra_mount_args)
+    # Pass extras through run.sh via env-injected wrapper: run.sh doesn't
+    # accept arbitrary -v flags directly, so use docker run manually here.
+    "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+    local -a gpu_args=()
+    if detect_nvidia; then
+        gpu_args=(--gpus all)
+    else
+        gpu_args=(--device /dev/dri:/dev/dri)
+    fi
+
+    docker run -d \
+        --name "${CONTAINER_NAME}" \
+        --hostname "${CONTAINER_NAME}" \
+        --network host \
+        --ipc host \
+        -e "DISPLAY=${DISPLAY:-:0}" \
+        -e "QT_X11_NO_MITSHM=1" \
+        -e "XAUTHORITY=/tmp/.docker.xauth" \
+        -e "NVIDIA_VISIBLE_DEVICES=all" \
+        -e "NVIDIA_DRIVER_CAPABILITIES=all" \
+        -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
+        -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+        -v /tmp/.docker.xauth:/tmp/.docker.xauth:rw \
+        -v "${PROJECT_ROOT}/workspace:/home/ros/ros2_ws:rw" \
+        "${extra[@]}" \
+        "${gpu_args[@]}" \
+        "${IMAGE_NAME}:${IMAGE_TAG}" \
+        bash -c "trap : TERM INT; sleep infinity & wait" \
+        >/dev/null
+}
+
 ensure_running() {
-    # Make sure a detached container is up; bring one up if not.
     if container_running; then
+        if [ "${#ADHOC_MOUNTS[@]}" -gt 0 ] && ! current_mounts_match; then
+            warn "Existing container is missing requested mounts — restarting it."
+            docker rm -f "${CONTAINER_NAME}" >/dev/null
+            start_detached
+            sleep 0.5
+        fi
         return 0
     fi
-    log "Container ${CONTAINER_NAME} not running — starting it in the background"
-    "${SCRIPT_DIR}/scripts/run.sh" --detach --keep bash -c "trap : TERM INT; sleep infinity & wait" >/dev/null
-    # Give the container a moment to settle.
+    log "Starting container ${CONTAINER_NAME} in the background"
+    if ! docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
+        warn "Image ${IMAGE_NAME}:${IMAGE_TAG} not built — building first."
+        "${SCRIPTS_DIR}/build.sh"
+    fi
+    start_detached
     sleep 0.5
 }
 
-in_container() {
-    # Run a command inside the (already-running) container.
-    ensure_running
-    docker exec -it "${CONTAINER_NAME}" bash -lc "$*"
+# ---------------------------------------------------------------------------
+# Terminal autodetect
+# ---------------------------------------------------------------------------
+# Echoes a bash array of {emulator, ...args, exec-flag} ready for `"$@" CMD`.
+
+detect_terminal() {
+    local candidates=(
+        "${FORCED_TERMINAL}"
+        "${TERMINAL:-}"
+        "gnome-terminal" "konsole" "xfce4-terminal" "alacritty" "kitty"
+        "foot" "tilix" "mate-terminal" "terminator" "lxterminal" "x-terminal-emulator"
+        "xterm"
+    )
+    local t
+    for t in "${candidates[@]}"; do
+        [ -z "${t}" ] && continue
+        if command -v "${t%% *}" >/dev/null 2>&1; then
+            printf '%s' "${t}"
+            return 0
+        fi
+    done
+    return 1
 }
 
-in_container_raw() {
-    # Run argv inside the container without shell wrapping.
-    ensure_running
-    docker exec -it "${CONTAINER_NAME}" "$@"
+open_in_terminal() {
+    # Run "$@" inside a new terminal window. Falls back to inline if no
+    # terminal emulator can be found or DISPLAY is unset.
+    local cmd_str=""
+    local arg
+    for arg in "$@"; do
+        # Quote each argument safely.
+        cmd_str+=" $(printf '%q' "${arg}")"
+    done
+    cmd_str="${cmd_str# }"
+
+    if [ "${OPEN_INLINE}" -eq 1 ] || [ -z "${DISPLAY:-}" ]; then
+        eval "${cmd_str}"
+        return $?
+    fi
+
+    local term; term="$(detect_terminal || true)"
+    if [ -z "${term}" ]; then
+        warn "No terminal emulator found — running inline."
+        eval "${cmd_str}"
+        return $?
+    fi
+
+    log "Opening in new ${term} window"
+    case "${term}" in
+        gnome-terminal|mate-terminal|tilix)
+            nohup "${term}" -- bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
+            ;;
+        konsole)
+            nohup konsole -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
+            ;;
+        xfce4-terminal|lxterminal|terminator)
+            nohup "${term}" -e "bash -c '${cmd_str//\'/\'\\\'\'}; exec bash'" >/dev/null 2>&1 &
+            ;;
+        alacritty|kitty|foot)
+            nohup "${term}" -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
+            ;;
+        x-terminal-emulator|xterm)
+            nohup "${term}" -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
+            ;;
+        *)
+            # Generic best-effort.
+            nohup "${term}" -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
+            ;;
+    esac
+    disown 2>/dev/null || true
 }
+
+# ---------------------------------------------------------------------------
+# Subcommand implementations
+# ---------------------------------------------------------------------------
 
 cmd_shell() {
-    if container_running; then
-        log "Attaching to running container ${CONTAINER_NAME}"
-        exec docker exec -it "${CONTAINER_NAME}" bash
-    fi
-    log "Starting a fresh interactive container"
-    exec "${SCRIPT_DIR}/scripts/run.sh"
+    ensure_running
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" bash
 }
 
 cmd_term() {
-    # Always opens an *additional* shell — fails if nothing is running.
     if ! container_running; then
-        err "No container running. Use './ros2gz shell' to start one."
+        err "No container running. Use './ros2gz shell' or './ros2gz up' first."
         exit 1
     fi
-    exec docker exec -it "${CONTAINER_NAME}" bash
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" bash
 }
 
 cmd_gazebo() {
     local world="${1:-shapes.sdf}"
-    "${SCRIPT_DIR}/scripts/setup_x11.sh" >/dev/null
+    "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
     ensure_running
-    log "Launching Gazebo (world=${world}) inside ${CONTAINER_NAME}"
-    exec docker exec -it "${CONTAINER_NAME}" gz sim -v 4 "${world}"
+    log "Launching Gazebo (world=${world})"
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" gz sim -v 4 "${world}"
 }
 
 cmd_rviz() {
     local cfg="${1:-/home/ros/.rviz2/default.rviz}"
-    "${SCRIPT_DIR}/scripts/setup_x11.sh" >/dev/null
+    "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
     ensure_running
-    log "Launching RViz2 inside ${CONTAINER_NAME}"
-    exec docker exec -it "${CONTAINER_NAME}" rviz2 -d "${cfg}"
+    log "Launching RViz2"
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" rviz2 -d "${cfg}"
 }
 
 cmd_gz_rviz() {
-    "${SCRIPT_DIR}/scripts/setup_x11.sh" >/dev/null
+    "${SCRIPTS_DIR}/setup_x11.sh" >/dev/null
     ensure_running
-    log "Launching Gazebo + bridge + RViz inside ${CONTAINER_NAME}"
-    exec docker exec -it "${CONTAINER_NAME}" \
+    log "Launching Gazebo + bridge + RViz"
+    open_in_terminal docker exec -it "${CONTAINER_NAME}" \
         ros2 launch /home/ros/.config/ros2-gazeebo/launch/gz_rviz.launch.py "$@"
 }
 
-cmd_ros2() {
-    in_container_raw ros2 "$@"
+cmd_ros2()    { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 "$@"; }
+cmd_exec()    {
+    if [ "$#" -eq 0 ]; then err "Usage: ./ros2gz exec <command> [args...]"; exit 1; fi
+    ensure_running; docker exec -it "${CONTAINER_NAME}" "$@";
 }
-
-cmd_exec() {
-    if [ "$#" -eq 0 ]; then
-        err "Usage: ./ros2gz exec <command> [args...]"
-        exit 1
-    fi
-    in_container_raw "$@"
-}
-
-cmd_topics()  { in_container_raw ros2 topic list; }
-cmd_nodes()   { in_container_raw ros2 node list;  }
-cmd_doctor()  { in_container_raw ros2 doctor;     }
+cmd_topics()  { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 topic list; }
+cmd_nodes()   { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 node list;  }
+cmd_doctor()  { ensure_running; docker exec -it "${CONTAINER_NAME}" ros2 doctor;     }
 
 cmd_build_ws() {
     ensure_running
-    log "Running colcon build in /home/ros/ros2_ws"
+    log "Running rosdep + colcon build in /home/ros/ros2_ws"
     docker exec -it "${CONTAINER_NAME}" bash -lc \
         "cd ~/ros2_ws && rosdep install --from-paths src --ignore-src -r -y && colcon build --symlink-install"
 }
 
 cmd_logs() {
-    if ! container_running; then
-        err "Container ${CONTAINER_NAME} is not running."
-        exit 1
-    fi
+    container_running || { err "Container ${CONTAINER_NAME} is not running."; exit 1; }
     exec docker logs -f "${CONTAINER_NAME}"
 }
 
 cmd_status() {
     if container_running; then
-        local id
-        id="$(docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}  {{.Status}}  ({{.Image}})')"
-        ok "Running: ${id}"
+        ok "Running: $(docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}  {{.Status}}  ({{.Image}})')"
     elif docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
         warn "Container exists but is stopped."
     else
@@ -142,44 +371,103 @@ cmd_status() {
     if docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
         ok "Image present: ${IMAGE_NAME}:${IMAGE_TAG}"
     else
-        warn "Image ${IMAGE_NAME}:${IMAGE_TAG} not built yet. Run: ./ros2gz rebuild"
+        warn "Image not built. Run: ./ros2gz rebuild"
+    fi
+    local m
+    if all_mounts | grep -q .; then
+        log "Extra mounts:"
+        all_mounts | while IFS= read -r m; do
+            printf "    %s\n" "${m}"
+        done
     fi
 }
 
 cmd_up() {
-    if container_running; then
-        ok "Already running."
-        return 0
-    fi
     ensure_running
     ok "Container ${CONTAINER_NAME} is up in the background."
-    log "Use './ros2gz term' to open a shell or './ros2gz gazebo' to launch sim."
+    log "  ./ros2gz term     # open a shell"
+    log "  ./ros2gz gazebo   # launch sim"
 }
 
-cmd_stop()    { exec "${SCRIPT_DIR}/scripts/stop.sh";  }
-cmd_rebuild() { exec "${SCRIPT_DIR}/scripts/build.sh"; }
-cmd_clean()   { exec "${SCRIPT_DIR}/scripts/clean.sh"; }
+cmd_stop()    { exec "${SCRIPTS_DIR}/stop.sh";  }
+cmd_rebuild() { exec "${SCRIPTS_DIR}/build.sh"; }
+cmd_clean()   { exec "${SCRIPTS_DIR}/clean.sh"; }
+
+cmd_mounts() {
+    log "Saved mounts (${EXTRA_MOUNTS_FILE}):"
+    if [ -f "${EXTRA_MOUNTS_FILE}" ] && [ -s "${EXTRA_MOUNTS_FILE}" ]; then
+        sed 's/^/    /' "${EXTRA_MOUNTS_FILE}"
+    else
+        printf "    (none)\n"
+    fi
+    if [ "${#ADHOC_MOUNTS[@]}" -gt 0 ]; then
+        log "Ad-hoc mounts for this invocation:"
+        printf "    %s\n" "${ADHOC_MOUNTS[@]}"
+    fi
+}
 
 cmd_help() {
-    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------------------
 # Interactive menu
 # ---------------------------------------------------------------------------
 
+menu_add_mount() {
+    local p cp
+    printf "Host path to mount (absolute or ~/...): " >&2
+    read -r p </dev/tty || return 0
+    [ -z "${p}" ] && return 0
+    printf "Container path [/home/ros/mounts/$(basename "${p}")]: " >&2
+    read -r cp </dev/tty || true
+    cp="${cp:-/home/ros/mounts/$(basename "${p}")}"
+    local resolved
+    resolved="$(resolve_mount "${p}:${cp}")" || return 1
+    printf "Save permanently (so it auto-mounts next time)? [y/N]: " >&2
+    local yn; read -r yn </dev/tty || true
+    if [[ "${yn}" =~ ^[Yy]$ ]]; then
+        persist_mount "${resolved}"
+    else
+        ADHOC_MOUNTS+=("${resolved}")
+        ok "Will mount this session: ${resolved}"
+    fi
+    if container_running && ! current_mounts_match; then
+        warn "Container is running — restart it with option 13 (stop) then 12 (up) to apply."
+    fi
+}
+
+menu_remove_mount() {
+    [ -f "${EXTRA_MOUNTS_FILE}" ] || { warn "No saved mounts."; return; }
+    local -a lines=()
+    mapfile -t lines < <(saved_mounts)
+    if [ "${#lines[@]}" -eq 0 ]; then warn "No saved mounts."; return; fi
+    local i=1
+    for m in "${lines[@]}"; do printf "  %d) %s\n" "${i}" "${m}"; i=$((i+1)); done
+    printf "Remove which? [number, blank to cancel]: " >&2
+    local n; read -r n </dev/tty || return 0
+    [[ "${n}" =~ ^[0-9]+$ ]] || return 0
+    [ "${n}" -ge 1 ] && [ "${n}" -le "${#lines[@]}" ] || return 0
+    local target="${lines[$((n-1))]}"
+    grep -Fxv "${target}" "${EXTRA_MOUNTS_FILE}" > "${EXTRA_MOUNTS_FILE}.tmp" || true
+    mv "${EXTRA_MOUNTS_FILE}.tmp" "${EXTRA_MOUNTS_FILE}"
+    ok "Removed: ${target}"
+}
+
 menu() {
     local choice
     while true; do
         printf "\n${C_BLUE}=== ROS2-Gazeebo ===${C_RESET}\n"
         if container_running; then
-            printf "  ${C_GREEN}● container running${C_RESET} (%s)\n" "${CONTAINER_NAME}"
+            printf "  ${C_GREEN}● running${C_RESET} (%s)\n" "${CONTAINER_NAME}"
         else
-            printf "  ${C_YELLOW}○ container stopped${C_RESET}\n"
+            printf "  ${C_YELLOW}○ stopped${C_RESET}\n"
         fi
+        local n; n="$(all_mounts | grep -c . || true)"
+        printf "  ${C_BLUE}mounts:${C_RESET} %s extra\n" "${n}"
         cat <<MENU
 
-  1) Open shell in container
+  1) Open shell (new terminal window)
   2) Open another terminal (existing container)
   3) Launch Gazebo
   4) Launch RViz2
@@ -194,20 +482,21 @@ menu() {
  13) Stop container
  14) Rebuild image
  15) Run a custom command
+ 16) Add a folder mount
+ 17) Remove a saved mount
+ 18) List mounts
   q) Quit
 MENU
-        read -rp "Pick an option: " choice
+        printf "Pick: " >&2
+        read -r choice </dev/tty || exit 0
         case "${choice}" in
             1)  cmd_shell ;;
             2)  cmd_term ;;
-            3)
-                read -rp "World file [shapes.sdf]: " w
-                cmd_gazebo "${w:-shapes.sdf}"
-                ;;
-            4)
-                read -rp "RViz config [/home/ros/.rviz2/default.rviz]: " c
-                cmd_rviz "${c:-/home/ros/.rviz2/default.rviz}"
-                ;;
+            3)  printf "World [shapes.sdf]: " >&2; read -r w </dev/tty || true
+                cmd_gazebo "${w:-shapes.sdf}" ;;
+            4)  printf "RViz config [/home/ros/.rviz2/default.rviz]: " >&2
+                read -r c </dev/tty || true
+                cmd_rviz "${c:-/home/ros/.rviz2/default.rviz}" ;;
             5)  cmd_gz_rviz ;;
             6)  cmd_topics ;;
             7)  cmd_nodes ;;
@@ -218,10 +507,12 @@ MENU
             12) cmd_up ;;
             13) cmd_stop ;;
             14) cmd_rebuild ;;
-            15)
-                read -rp "Command (run inside container): " cmdline
-                [ -n "${cmdline}" ] && in_container "${cmdline}"
-                ;;
+            15) printf "Command (inside container): " >&2
+                read -r cmdline </dev/tty || true
+                [ -n "${cmdline}" ] && docker exec -it "${CONTAINER_NAME}" bash -lc "${cmdline}" ;;
+            16) menu_add_mount ;;
+            17) menu_remove_mount ;;
+            18) cmd_mounts ;;
             q|Q|"") exit 0 ;;
             *) warn "Unknown option: ${choice}" ;;
         esac
@@ -229,7 +520,7 @@ MENU
 }
 
 # ---------------------------------------------------------------------------
-# Subcommand dispatch
+# Dispatch
 # ---------------------------------------------------------------------------
 
 if [ "$#" -eq 0 ]; then
@@ -239,28 +530,25 @@ fi
 
 sub="$1"; shift
 case "${sub}" in
-    shell)      cmd_shell "$@" ;;
-    term)       cmd_term "$@" ;;
-    gazebo|gz|sim) cmd_gazebo "$@" ;;
-    rviz|rviz2) cmd_rviz "$@" ;;
-    gz-rviz|gzrviz|sim-rviz) cmd_gz_rviz "$@" ;;
-    demo)       cmd_gazebo shapes.sdf ;;
-    ros2)       cmd_ros2 "$@" ;;
-    exec|run)   cmd_exec "$@" ;;
-    topics)     cmd_topics ;;
-    nodes)      cmd_nodes ;;
-    doctor)     cmd_doctor ;;
-    build-ws|colcon) cmd_build_ws ;;
-    logs)       cmd_logs ;;
-    status)     cmd_status ;;
-    up|start)   cmd_up ;;
-    stop|down)  cmd_stop ;;
-    rebuild|build) cmd_rebuild ;;
-    clean)      cmd_clean ;;
-    help|-h|--help) cmd_help ;;
-    *)
-        err "Unknown subcommand: ${sub}"
-        cmd_help
-        exit 1
-        ;;
+    shell)                    cmd_shell "$@" ;;
+    term)                     cmd_term "$@" ;;
+    gazebo|gz|sim)            cmd_gazebo "$@" ;;
+    rviz|rviz2)               cmd_rviz "$@" ;;
+    gz-rviz|gzrviz|sim-rviz)  cmd_gz_rviz "$@" ;;
+    demo)                     cmd_gazebo shapes.sdf ;;
+    ros2)                     cmd_ros2 "$@" ;;
+    exec|run)                 cmd_exec "$@" ;;
+    topics)                   cmd_topics ;;
+    nodes)                    cmd_nodes ;;
+    doctor)                   cmd_doctor ;;
+    build-ws|colcon)          cmd_build_ws ;;
+    logs)                     cmd_logs ;;
+    status)                   cmd_status ;;
+    up|start)                 cmd_up ;;
+    stop|down)                cmd_stop ;;
+    rebuild|build)            cmd_rebuild ;;
+    clean)                    cmd_clean ;;
+    mounts)                   cmd_mounts ;;
+    help|-h|--help)           cmd_help ;;
+    *) err "Unknown subcommand: ${sub}"; cmd_help; exit 1 ;;
 esac

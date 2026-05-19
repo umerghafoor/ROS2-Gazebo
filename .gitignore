@@ -18,3 +18,6 @@ workspace/log/
 
 # X11 cookie (recreated by setup_x11.sh)
 .docker.xauth
+
+# Per-user ros2gz mount list
+.ros2gz.mounts
