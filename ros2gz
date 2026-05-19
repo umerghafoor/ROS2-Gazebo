@@ -292,12 +292,30 @@ detect_terminal() {
 spawn_terminal() {
     # spawn_terminal TERM CMD_STR
     # Launches TERM with bash -c "CMD_STR; exec bash" detached.
-    # When invoked under sudo with SUDO_USER set, drops privileges so
-    # gnome-terminal / konsole / etc. can reach the user's D-Bus session.
+    #
+    # Under sudo (have_sudo_user) we must reconcile two conflicting needs:
+    #   - The terminal emulator (gnome-terminal/konsole/etc.) needs to run
+    #     as $SUDO_USER so it can reach the user's D-Bus / Wayland session.
+    #   - The COMMAND inside the terminal needs to talk to docker.sock,
+    #     which is only readable by root + the docker group; $SUDO_USER
+    #     typically isn't in the docker group (that's why they used sudo).
+    # Solution: launch terminal as $SUDO_USER, but wrap the inner payload
+    # in `sudo` so it re-elevates to root for docker access. We pass an
+    # explicit `-E` so DISPLAY/XAUTHORITY/etc. survive the re-elevation.
     local term="$1"
     local cmd_str="$2"
     local -a launch=()
-    local payload="${cmd_str}; exec bash"
+    local payload
+
+    if have_sudo_user; then
+        # Re-elevate inside the terminal so `docker exec` etc. work.
+        # `sudo -E` preserves the env; `bash -lc` runs as a login shell so
+        # /opt/ros/setup.bash etc. get sourced normally (in case the user
+        # later types non-docker commands).
+        payload="sudo -E bash -lc $(printf '%q' "${cmd_str}"); exec sudo -E bash -l"
+    else
+        payload="${cmd_str}; exec bash"
+    fi
 
     case "${term}" in
         gnome-terminal|mate-terminal|tilix)
@@ -350,7 +368,8 @@ open_in_terminal() {
     if is_root && ! have_sudo_user; then
         log "Opening in new ${term} window (root mode — D-Bus terminals skipped)"
     elif have_sudo_user; then
-        log "Opening in new ${term} window (as ${SUDO_USER})"
+        log "Opening in new ${term} window as ${SUDO_USER}, re-elevating with sudo inside"
+        log "  (the new window may prompt for your sudo password)"
     else
         log "Opening in new ${term} window"
     fi
