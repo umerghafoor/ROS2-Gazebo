@@ -58,6 +58,36 @@ make run
 make demo    # opens Gazebo with the shapes world
 ```
 
+### One-stop launcher: `./ros2gz`
+
+Tired of typing `docker exec` and remembering script paths? Run
+[ros2gz](ros2gz) at the repo root — with no args it shows an interactive
+menu; with a subcommand it just does the thing:
+
+```bash
+./ros2gz                  # interactive menu
+./ros2gz shell            # open bash inside the container
+./ros2gz term             # open another shell (existing container)
+./ros2gz gazebo           # launch gz sim
+./ros2gz rviz             # launch RViz2
+./ros2gz gz-rviz          # gazebo + bridge + RViz together
+./ros2gz topics           # ros2 topic list (no exec needed)
+./ros2gz nodes            # ros2 node list
+./ros2gz doctor           # ros2 doctor
+./ros2gz build-ws         # rosdep install + colcon build in ~/ros2_ws
+./ros2gz ros2 bag record /clock  # forward any ros2 CLI args
+./ros2gz exec gz topic -l        # run any command inside the container
+./ros2gz status           # is the container up? is the image built?
+./ros2gz up               # start a detached container in the background
+./ros2gz stop             # stop & remove it
+./ros2gz rebuild          # rebuild the image
+./ros2gz help             # full subcommand list
+```
+
+It auto-detects whether a container is running, starts a detached one if
+needed, wires up X11 before launching GUI apps, and reuses the same
+container for every command so everything shares one ROS DDS domain.
+
 ---
 
 ## What the scripts do

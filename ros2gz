@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# ros2gz — one-stop launcher for the ROS2-Gazeebo container.
+#
+# Run with no args for an interactive menu, or pass a subcommand:
+#
+#   ./ros2gz                # interactive menu
+#   ./ros2gz shell          # open bash inside the container
+#   ./ros2gz term           # open another bash in the running container
+#   ./ros2gz gazebo [WORLD] # launch Gazebo (default: shapes.sdf)
+#   ./ros2gz rviz [CONFIG]  # launch RViz2
+#   ./ros2gz gz-rviz        # Gazebo + bridge + RViz together
+#   ./ros2gz demo           # same as gazebo with shapes.sdf
+#   ./ros2gz ros2 ARGS...   # run a ros2 CLI command (e.g. ros2 topic list)
+#   ./ros2gz exec CMD...    # run any command in the container
+#   ./ros2gz topics         # quick ros2 topic list
+#   ./ros2gz nodes          # quick ros2 node list
+#   ./ros2gz doctor         # ros2 doctor
+#   ./ros2gz build-ws       # colcon build inside the container
+#   ./ros2gz logs           # tail container logs
+#   ./ros2gz status         # show whether the container is running
+#   ./ros2gz up             # start a detached container (no GUI)
+#   ./ros2gz stop           # stop & remove the container
+#   ./ros2gz rebuild        # rebuild the docker image
+#   ./ros2gz clean          # remove image (and stop container)
+#   ./ros2gz help           # show this help
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/common.sh
+source "${SCRIPT_DIR}/scripts/common.sh"
+
+container_running() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"
+}
+
+ensure_running() {
+    # Make sure a detached container is up; bring one up if not.
+    if container_running; then
+        return 0
+    fi
+    log "Container ${CONTAINER_NAME} not running — starting it in the background"
+    "${SCRIPT_DIR}/scripts/run.sh" --detach --keep bash -c "trap : TERM INT; sleep infinity & wait" >/dev/null
+    # Give the container a moment to settle.
+    sleep 0.5
+}
+
+in_container() {
+    # Run a command inside the (already-running) container.
+    ensure_running
+    docker exec -it "${CONTAINER_NAME}" bash -lc "$*"
+}
+
+in_container_raw() {
+    # Run argv inside the container without shell wrapping.
+    ensure_running
+    docker exec -it "${CONTAINER_NAME}" "$@"
+}
+
+cmd_shell() {
+    if container_running; then
+        log "Attaching to running container ${CONTAINER_NAME}"
+        exec docker exec -it "${CONTAINER_NAME}" bash
+    fi
+    log "Starting a fresh interactive container"
+    exec "${SCRIPT_DIR}/scripts/run.sh"
+}
+
+cmd_term() {
+    # Always opens an *additional* shell — fails if nothing is running.
+    if ! container_running; then
+        err "No container running. Use './ros2gz shell' to start one."
+        exit 1
+    fi
+    exec docker exec -it "${CONTAINER_NAME}" bash
+}
+
+cmd_gazebo() {
+    local world="${1:-shapes.sdf}"
+    "${SCRIPT_DIR}/scripts/setup_x11.sh" >/dev/null
+    ensure_running
+    log "Launching Gazebo (world=${world}) inside ${CONTAINER_NAME}"
+    exec docker exec -it "${CONTAINER_NAME}" gz sim -v 4 "${world}"
+}
+
+cmd_rviz() {
+    local cfg="${1:-/home/ros/.rviz2/default.rviz}"
+    "${SCRIPT_DIR}/scripts/setup_x11.sh" >/dev/null
+    ensure_running
+    log "Launching RViz2 inside ${CONTAINER_NAME}"
+    exec docker exec -it "${CONTAINER_NAME}" rviz2 -d "${cfg}"
+}
+
+cmd_gz_rviz() {
+    "${SCRIPT_DIR}/scripts/setup_x11.sh" >/dev/null
+    ensure_running
+    log "Launching Gazebo + bridge + RViz inside ${CONTAINER_NAME}"
+    exec docker exec -it "${CONTAINER_NAME}" \
+        ros2 launch /home/ros/.config/ros2-gazeebo/launch/gz_rviz.launch.py "$@"
+}
+
+cmd_ros2() {
+    in_container_raw ros2 "$@"
+}
+
+cmd_exec() {
+    if [ "$#" -eq 0 ]; then
+        err "Usage: ./ros2gz exec <command> [args...]"
+        exit 1
+    fi
+    in_container_raw "$@"
+}
+
+cmd_topics()  { in_container_raw ros2 topic list; }
+cmd_nodes()   { in_container_raw ros2 node list;  }
+cmd_doctor()  { in_container_raw ros2 doctor;     }
+
+cmd_build_ws() {
+    ensure_running
+    log "Running colcon build in /home/ros/ros2_ws"
+    docker exec -it "${CONTAINER_NAME}" bash -lc \
+        "cd ~/ros2_ws && rosdep install --from-paths src --ignore-src -r -y && colcon build --symlink-install"
+}
+
+cmd_logs() {
+    if ! container_running; then
+        err "Container ${CONTAINER_NAME} is not running."
+        exit 1
+    fi
+    exec docker logs -f "${CONTAINER_NAME}"
+}
+
+cmd_status() {
+    if container_running; then
+        local id
+        id="$(docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}  {{.Status}}  ({{.Image}})')"
+        ok "Running: ${id}"
+    elif docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+        warn "Container exists but is stopped."
+    else
+        warn "No container."
+    fi
+    if docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
+        ok "Image present: ${IMAGE_NAME}:${IMAGE_TAG}"
+    else
+        warn "Image ${IMAGE_NAME}:${IMAGE_TAG} not built yet. Run: ./ros2gz rebuild"
+    fi
+}
+
+cmd_up() {
+    if container_running; then
+        ok "Already running."
+        return 0
+    fi
+    ensure_running
+    ok "Container ${CONTAINER_NAME} is up in the background."
+    log "Use './ros2gz term' to open a shell or './ros2gz gazebo' to launch sim."
+}
+
+cmd_stop()    { exec "${SCRIPT_DIR}/scripts/stop.sh";  }
+cmd_rebuild() { exec "${SCRIPT_DIR}/scripts/build.sh"; }
+cmd_clean()   { exec "${SCRIPT_DIR}/scripts/clean.sh"; }
+
+cmd_help() {
+    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------------
+
+menu() {
+    local choice
+    while true; do
+        printf "\n${C_BLUE}=== ROS2-Gazeebo ===${C_RESET}\n"
+        if container_running; then
+            printf "  ${C_GREEN}● container running${C_RESET} (%s)\n" "${CONTAINER_NAME}"
+        else
+            printf "  ${C_YELLOW}○ container stopped${C_RESET}\n"
+        fi
+        cat <<MENU
+
+  1) Open shell in container
+  2) Open another terminal (existing container)
+  3) Launch Gazebo
+  4) Launch RViz2
+  5) Launch Gazebo + Bridge + RViz
+  6) ros2 topic list
+  7) ros2 node list
+  8) ros2 doctor
+  9) colcon build (~/ros2_ws)
+ 10) Show status
+ 11) Tail container logs
+ 12) Start container in background
+ 13) Stop container
+ 14) Rebuild image
+ 15) Run a custom command
+  q) Quit
+MENU
+        read -rp "Pick an option: " choice
+        case "${choice}" in
+            1)  cmd_shell ;;
+            2)  cmd_term ;;
+            3)
+                read -rp "World file [shapes.sdf]: " w
+                cmd_gazebo "${w:-shapes.sdf}"
+                ;;
+            4)
+                read -rp "RViz config [/home/ros/.rviz2/default.rviz]: " c
+                cmd_rviz "${c:-/home/ros/.rviz2/default.rviz}"
+                ;;
+            5)  cmd_gz_rviz ;;
+            6)  cmd_topics ;;
+            7)  cmd_nodes ;;
+            8)  cmd_doctor ;;
+            9)  cmd_build_ws ;;
+            10) cmd_status ;;
+            11) cmd_logs ;;
+            12) cmd_up ;;
+            13) cmd_stop ;;
+            14) cmd_rebuild ;;
+            15)
+                read -rp "Command (run inside container): " cmdline
+                [ -n "${cmdline}" ] && in_container "${cmdline}"
+                ;;
+            q|Q|"") exit 0 ;;
+            *) warn "Unknown option: ${choice}" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand dispatch
+# ---------------------------------------------------------------------------
+
+if [ "$#" -eq 0 ]; then
+    menu
+    exit 0
+fi
+
+sub="$1"; shift
+case "${sub}" in
+    shell)      cmd_shell "$@" ;;
+    term)       cmd_term "$@" ;;
+    gazebo|gz|sim) cmd_gazebo "$@" ;;
+    rviz|rviz2) cmd_rviz "$@" ;;
+    gz-rviz|gzrviz|sim-rviz) cmd_gz_rviz "$@" ;;
+    demo)       cmd_gazebo shapes.sdf ;;
+    ros2)       cmd_ros2 "$@" ;;
+    exec|run)   cmd_exec "$@" ;;
+    topics)     cmd_topics ;;
+    nodes)      cmd_nodes ;;
+    doctor)     cmd_doctor ;;
+    build-ws|colcon) cmd_build_ws ;;
+    logs)       cmd_logs ;;
+    status)     cmd_status ;;
+    up|start)   cmd_up ;;
+    stop|down)  cmd_stop ;;
+    rebuild|build) cmd_rebuild ;;
+    clean)      cmd_clean ;;
+    help|-h|--help) cmd_help ;;
+    *)
+        err "Unknown subcommand: ${sub}"
+        cmd_help
+        exit 1
+        ;;
+esac
