@@ -41,7 +41,7 @@ while [[ $# -gt 0 ]]; do
         *)  POSITIONAL+=("$1"); shift;;
     esac
 done
-set -- "${POSITIONAL[@]:-}"
+set -- "${POSITIONAL[@]}"
 
 if ! docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
     warn "Image ${IMAGE_NAME}:${IMAGE_TAG} not found locally. Building it now…"
