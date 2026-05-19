@@ -23,6 +23,7 @@ source "${SCRIPT_DIR}/common.sh"
 source "${SCRIPT_DIR}/setup_x11.sh"
 
 require_cmd docker
+check_docker_access
 
 REMOVE_ON_EXIT=1
 DETACH=0

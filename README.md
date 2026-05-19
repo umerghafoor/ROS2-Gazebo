@@ -63,15 +63,73 @@ inside a container, while still letting you:
 git clone https://github.com/umerghafoor/ROS2-Gazeebo.git
 cd ROS2-Gazeebo
 
-# 1. Build the image (~10–15 min the first time, mostly downloads)
+# 1. Get the image — either pull the prebuilt one (~2 min)…
+./ros2gz pull
+
+#    …or build it locally from the Dockerfile (~10–15 min)
 ./scripts/build.sh
 
 # 2. Launch an interactive shell (sets up X11, GPU automatically)
-./scripts/run.sh
+./ros2gz shell        # or: ./scripts/run.sh
 
 # 3. Inside the container — verify everything works
 ros2 doctor
 gz sim shapes.sdf
+```
+
+### Get the image
+
+| Source      | Command                                    | Time       | When to use                                                       |
+|-------------|--------------------------------------------|------------|-------------------------------------------------------------------|
+| Docker Hub  | `./ros2gz pull`                            | ~2 min     | Default. You just want to use the image.                          |
+| Local build | `./scripts/build.sh` or `./ros2gz rebuild` | ~10–15 min | You changed the Dockerfile, or want a different ROS/Gazebo combo. |
+
+Prebuilt images live at
+[`umerghafoor/ros2-gazebo`](https://hub.docker.com/r/umerghafoor/ros2-gazebo)
+on Docker Hub:
+
+| Tag               | Stack                                   |
+|-------------------|-----------------------------------------|
+| `jazzy-harmonic`  | ROS 2 Jazzy + Gazebo Harmonic (default) |
+| `humble-fortress` | ROS 2 Humble + Gazebo Fortress          |
+| `latest`          | alias for `jazzy-harmonic`              |
+
+Pull a specific tag with:
+
+```bash
+REMOTE_IMAGE=umerghafoor/ros2-gazebo:humble-fortress \
+    IMAGE_TAG=humble-fortress \
+    ./ros2gz pull
+
+# or pass it directly
+./ros2gz pull umerghafoor/ros2-gazebo:humble-fortress
+```
+
+### Running with `sudo` (no docker-group membership)
+
+Don't want to add your user to the `docker` group? Every script in this
+repo works with `sudo` out of the box:
+
+```bash
+sudo ./scripts/build.sh
+sudo ./ros2gz           # interactive menu, GUIs spawn as your user via $SUDO_USER
+sudo ./ros2gz gazebo
+```
+
+The launcher detects `sudo` and:
+
+- uses `$SUDO_UID:$SUDO_GID` (not root's 0:0) when building the image, so
+  bind-mounted `workspace/` files stay owned by you, not root;
+- spawns new terminal windows as `$SUDO_USER` (re-attaching to your
+  D-Bus / X11 session) so gnome-terminal / konsole open cleanly;
+- under a pure-root login (no `$SUDO_USER`), automatically prefers
+  D-Bus-free terminals (alacritty / kitty / xterm).
+
+If you'd rather not type `sudo` every time, the alternative is the
+one-time setup:
+
+```bash
+sudo usermod -aG docker $USER && newgrp docker
 ```
 
 Or use the `Makefile`:

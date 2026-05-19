@@ -10,6 +10,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="${IMAGE_NAME:-ros2-gazebo}"
 IMAGE_TAG="${IMAGE_TAG:-jazzy-harmonic}"
 CONTAINER_NAME="${CONTAINER_NAME:-ros2-gazebo}"
+# Remote (Docker Hub) image. `./ros2gz pull` fetches this and re-tags it
+# locally as ${IMAGE_NAME}:${IMAGE_TAG} so the rest of the scripts find it.
+REMOTE_IMAGE="${REMOTE_IMAGE:-umerghafoor/ros2-gazebo:jazzy-harmonic}"
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 GZ_DISTRO="${GZ_DISTRO:-harmonic}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-24.04}"
@@ -35,6 +38,24 @@ require_cmd() {
         err "Required command not found: $1"
         return 1
     fi
+}
+
+check_docker_access() {
+    # Verify the user (or sudo'd root) can actually talk to the Docker daemon.
+    # If not, print a clear, actionable hint and exit — better than letting
+    # every subsequent command spew "permission denied" against docker.sock.
+    if docker info >/dev/null 2>&1; then
+        return 0
+    fi
+    err "Cannot connect to the Docker daemon."
+    if [ "$(id -u)" != "0" ] && ! groups | grep -qw docker; then
+        warn "You are not in the 'docker' group. Pick one:"
+        warn "  1) Run with sudo:   sudo $(basename "$0" 2>/dev/null) ..."
+        warn "  2) Add to group:    sudo usermod -aG docker \$USER && newgrp docker"
+    else
+        warn "Is the Docker daemon running?  sudo systemctl status docker"
+    fi
+    exit 1
 }
 
 detect_nvidia() {

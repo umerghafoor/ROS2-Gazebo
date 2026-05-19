@@ -20,7 +20,8 @@
 #   ./ros2gz status                # show container/image status
 #   ./ros2gz up                    # start a detached container (no GUI)
 #   ./ros2gz stop                  # stop & remove the container
-#   ./ros2gz rebuild               # rebuild the docker image
+#   ./ros2gz pull [REMOTE]         # pull prebuilt image from Docker Hub
+#   ./ros2gz rebuild               # rebuild the docker image locally
 #   ./ros2gz clean                 # remove image (and stop container)
 #   ./ros2gz mounts                # list extra mounts configured
 #   ./ros2gz help                  # show this help
@@ -41,6 +42,9 @@ source "${ROS2GZ_ROOT}/scripts/common.sh"
 # common.sh sets SCRIPT_DIR to its own location (scripts/) and
 # PROJECT_ROOT to the repo root. Use PROJECT_ROOT here to be unambiguous.
 SCRIPTS_DIR="${PROJECT_ROOT}/scripts"
+
+require_cmd docker
+check_docker_access
 
 EXTRA_MOUNTS_FILE="${PROJECT_ROOT}/.ros2gz.mounts"
 OPEN_INLINE=0
@@ -231,23 +235,94 @@ ensure_running() {
 # ---------------------------------------------------------------------------
 # Echoes a bash array of {emulator, ...args, exec-flag} ready for `"$@" CMD`.
 
+# Terminals that depend on the user session D-Bus (gnome-terminal, konsole,
+# tilix, mate-terminal). They fail under sudo with "Failed to connect to
+# user scope bus via local transport" because root has no DBUS session.
+DBUS_TERMINALS=" gnome-terminal konsole tilix mate-terminal "
+
+is_root()       { [ "$(id -u)" = "0" ]; }
+have_sudo_user() {
+    is_root && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]
+}
+
 detect_terminal() {
-    local candidates=(
+    # Order: explicit override (--terminal / $TERMINAL), then GUI-rich
+    # emulators, then plain xterm as last resort. Under sudo we deprioritize
+    # D-Bus-dependent terminals because they refuse to spawn for root.
+    local pref_a=(
         "${FORCED_TERMINAL}"
         "${TERMINAL:-}"
-        "gnome-terminal" "konsole" "xfce4-terminal" "alacritty" "kitty"
-        "foot" "tilix" "mate-terminal" "terminator" "lxterminal" "x-terminal-emulator"
-        "xterm"
     )
+    local pref_b=(
+        "gnome-terminal" "konsole" "xfce4-terminal" "alacritty" "kitty"
+        "foot" "tilix" "mate-terminal" "terminator" "lxterminal"
+        "x-terminal-emulator" "xterm"
+    )
+    # Under sudo (without a reachable original user), promote sudo-safe
+    # terminals to the front of the list.
+    if is_root && ! have_sudo_user; then
+        pref_b=(
+            "alacritty" "kitty" "foot" "xterm"
+            "xfce4-terminal" "lxterminal" "terminator"
+            "x-terminal-emulator"
+            "gnome-terminal" "konsole" "tilix" "mate-terminal"
+        )
+    fi
     local t
-    for t in "${candidates[@]}"; do
+    for t in "${pref_a[@]}" "${pref_b[@]}"; do
         [ -z "${t}" ] && continue
         if command -v "${t%% *}" >/dev/null 2>&1; then
+            # If user explicitly forced a terminal, honor it even under sudo.
+            if [ "${t}" = "${FORCED_TERMINAL}" ] || [ "${t}" = "${TERMINAL:-}" ]; then
+                printf '%s' "${t}"
+                return 0
+            fi
+            # Skip D-Bus-dependent terminals under sudo unless we can drop
+            # back to the original user (handled in spawn_terminal).
+            if is_root && ! have_sudo_user && [[ "${DBUS_TERMINALS}" == *" ${t} "* ]]; then
+                continue
+            fi
             printf '%s' "${t}"
             return 0
         fi
     done
     return 1
+}
+
+spawn_terminal() {
+    # spawn_terminal TERM CMD_STR
+    # Launches TERM with bash -c "CMD_STR; exec bash" detached.
+    # When invoked under sudo with SUDO_USER set, drops privileges so
+    # gnome-terminal / konsole / etc. can reach the user's D-Bus session.
+    local term="$1"
+    local cmd_str="$2"
+    local -a launch=()
+    local payload="${cmd_str}; exec bash"
+
+    case "${term}" in
+        gnome-terminal|mate-terminal|tilix)
+            launch=("${term}" -- bash -c "${payload}") ;;
+        xfce4-terminal|lxterminal|terminator)
+            launch=("${term}" -e "bash -c $(printf '%q' "${payload}")") ;;
+        *)  # konsole, alacritty, kitty, foot, xterm, x-terminal-emulator…
+            launch=("${term}" -e bash -c "${payload}") ;;
+    esac
+
+    if have_sudo_user; then
+        # Re-enter the original user's session so D-Bus / Wayland / X auth work.
+        local user_uid; user_uid="$(id -u "${SUDO_USER}")"
+        local xdg_runtime="/run/user/${user_uid}"
+        local dbus_addr="unix:path=${xdg_runtime}/bus"
+        nohup sudo -u "${SUDO_USER}" \
+            DISPLAY="${DISPLAY:-:0}" \
+            XAUTHORITY="${XAUTHORITY:-${HOME}/.Xauthority}" \
+            XDG_RUNTIME_DIR="${xdg_runtime}" \
+            DBUS_SESSION_BUS_ADDRESS="${dbus_addr}" \
+            "${launch[@]}" >/dev/null 2>&1 &
+    else
+        nohup "${launch[@]}" >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
 }
 
 open_in_terminal() {
@@ -256,7 +331,6 @@ open_in_terminal() {
     local cmd_str=""
     local arg
     for arg in "$@"; do
-        # Quote each argument safely.
         cmd_str+=" $(printf '%q' "${arg}")"
     done
     cmd_str="${cmd_str# }"
@@ -273,29 +347,14 @@ open_in_terminal() {
         return $?
     fi
 
-    log "Opening in new ${term} window"
-    case "${term}" in
-        gnome-terminal|mate-terminal|tilix)
-            nohup "${term}" -- bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
-            ;;
-        konsole)
-            nohup konsole -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
-            ;;
-        xfce4-terminal|lxterminal|terminator)
-            nohup "${term}" -e "bash -c '${cmd_str//\'/\'\\\'\'}; exec bash'" >/dev/null 2>&1 &
-            ;;
-        alacritty|kitty|foot)
-            nohup "${term}" -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
-            ;;
-        x-terminal-emulator|xterm)
-            nohup "${term}" -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
-            ;;
-        *)
-            # Generic best-effort.
-            nohup "${term}" -e bash -c "${cmd_str}; exec bash" >/dev/null 2>&1 &
-            ;;
-    esac
-    disown 2>/dev/null || true
+    if is_root && ! have_sudo_user; then
+        log "Opening in new ${term} window (root mode — D-Bus terminals skipped)"
+    elif have_sudo_user; then
+        log "Opening in new ${term} window (as ${SUDO_USER})"
+    else
+        log "Opening in new ${term} window"
+    fi
+    spawn_terminal "${term}" "${cmd_str}"
 }
 
 # ---------------------------------------------------------------------------
@@ -393,6 +452,25 @@ cmd_stop()    { exec "${SCRIPTS_DIR}/stop.sh";  }
 cmd_rebuild() { exec "${SCRIPTS_DIR}/build.sh"; }
 cmd_clean()   { exec "${SCRIPTS_DIR}/clean.sh"; }
 
+cmd_pull() {
+    # Pull the prebuilt image from Docker Hub and re-tag it locally as the
+    # name the rest of the scripts expect (${IMAGE_NAME}:${IMAGE_TAG}).
+    # Optional argument overrides the remote ref.
+    local remote="${1:-${REMOTE_IMAGE}}"
+    log "Pulling ${remote} from Docker Hub"
+    if ! docker pull "${remote}"; then
+        err "Pull failed. Check the image name (${remote}) and your network."
+        err "Falling back to a local build with: ./ros2gz rebuild"
+        return 1
+    fi
+    if [ "${remote}" != "${IMAGE_NAME}:${IMAGE_TAG}" ]; then
+        log "Tagging ${remote} as ${IMAGE_NAME}:${IMAGE_TAG}"
+        docker tag "${remote}" "${IMAGE_NAME}:${IMAGE_TAG}"
+        docker tag "${remote}" "${IMAGE_NAME}:latest"
+    fi
+    ok "Image ready: ${IMAGE_NAME}:${IMAGE_TAG}"
+}
+
 cmd_mounts() {
     log "Saved mounts (${EXTRA_MOUNTS_FILE}):"
     if [ -f "${EXTRA_MOUNTS_FILE}" ] && [ -s "${EXTRA_MOUNTS_FILE}" ]; then
@@ -480,11 +558,12 @@ menu() {
  11) Tail container logs
  12) Start container in background
  13) Stop container
- 14) Rebuild image
- 15) Run a custom command
- 16) Add a folder mount
- 17) Remove a saved mount
- 18) List mounts
+ 14) Rebuild image (local)
+ 15) Pull image from Docker Hub
+ 16) Run a custom command
+ 17) Add a folder mount
+ 18) Remove a saved mount
+ 19) List mounts
   q) Quit
 MENU
         printf "Pick: " >&2
@@ -507,12 +586,13 @@ MENU
             12) cmd_up ;;
             13) cmd_stop ;;
             14) cmd_rebuild ;;
-            15) printf "Command (inside container): " >&2
+            15) cmd_pull ;;
+            16) printf "Command (inside container): " >&2
                 read -r cmdline </dev/tty || true
                 [ -n "${cmdline}" ] && docker exec -it "${CONTAINER_NAME}" bash -lc "${cmdline}" ;;
-            16) menu_add_mount ;;
-            17) menu_remove_mount ;;
-            18) cmd_mounts ;;
+            17) menu_add_mount ;;
+            18) menu_remove_mount ;;
+            19) cmd_mounts ;;
             q|Q|"") exit 0 ;;
             *) warn "Unknown option: ${choice}" ;;
         esac
@@ -546,6 +626,7 @@ case "${sub}" in
     status)                   cmd_status ;;
     up|start)                 cmd_up ;;
     stop|down)                cmd_stop ;;
+    pull)                     cmd_pull "$@" ;;
     rebuild|build)            cmd_rebuild ;;
     clean)                    cmd_clean ;;
     mounts)                   cmd_mounts ;;

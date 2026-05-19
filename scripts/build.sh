@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 require_cmd docker
+check_docker_access
 
 log "Building image ${IMAGE_NAME}:${IMAGE_TAG}"
 log "  ROS_DISTRO     = ${ROS_DISTRO}"
