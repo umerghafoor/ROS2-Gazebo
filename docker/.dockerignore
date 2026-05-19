@@ -1,0 +1,12 @@
+.git
+.github
+**/.git
+**/node_modules
+**/__pycache__
+**/*.pyc
+workspace/build
+workspace/install
+workspace/log
+.vscode
+.idea
+*.swp

@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./scripts
+          additional_files: docker/entrypoint.sh
+
+  docker-build:
+    name: Build image (${{ matrix.ros }} / ${{ matrix.gz }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ros: jazzy
+            gz: harmonic
+            ubuntu: "24.04"
+          - ros: humble
+            gz: fortress
+            ubuntu: "22.04"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build (no push, layer cache only)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          build-args: |
+            ROS_DISTRO=${{ matrix.ros }}
+            GZ_DISTRO=${{ matrix.gz }}
+            UBUNTU_VERSION=${{ matrix.ubuntu }}
+          cache-from: type=gha,scope=${{ matrix.ros }}
+          cache-to: type=gha,scope=${{ matrix.ros }},mode=max
+          tags: ros2-gazebo:${{ matrix.ros }}-${{ matrix.gz }}
