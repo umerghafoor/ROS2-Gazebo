@@ -76,10 +76,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rosdep init \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --gid ${USER_GID} ${USERNAME} \
-    && useradd --uid ${USER_UID} --gid ${USER_GID} -m ${USERNAME} -s /bin/bash \
-    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
-    && chmod 0440 /etc/sudoers.d/${USERNAME}
+RUN set -eux; \
+    # Ubuntu 24.04 ships with a default 'ubuntu' user at UID 1000 — remove it
+    # if it would collide with the UID we want to assign to our 'ros' user.
+    if id -u ubuntu >/dev/null 2>&1 && [ "$(id -u ubuntu)" = "${USER_UID}" ]; then \
+        userdel -r ubuntu 2>/dev/null || userdel ubuntu; \
+    fi; \
+    # If a group already exists at this GID (e.g. root's GID 0), reuse it
+    # instead of creating a new one — otherwise add the group.
+    if getent group "${USER_GID}" >/dev/null; then \
+        existing_group="$(getent group "${USER_GID}" | cut -d: -f1)"; \
+        groupmod -n "${USERNAME}" "${existing_group}" || true; \
+    else \
+        groupadd --gid "${USER_GID}" "${USERNAME}"; \
+    fi; \
+    # Same idea for the UID — reuse it if taken, otherwise create the user.
+    if getent passwd "${USER_UID}" >/dev/null; then \
+        existing_user="$(getent passwd "${USER_UID}" | cut -d: -f1)"; \
+        usermod -l "${USERNAME}" -d "/home/${USERNAME}" -m -s /bin/bash "${existing_user}"; \
+        usermod -g "${USER_GID}" "${USERNAME}"; \
+    else \
+        useradd --uid "${USER_UID}" --gid "${USER_GID}" -m "${USERNAME}" -s /bin/bash; \
+    fi; \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
+    chmod 0440 "/etc/sudoers.d/${USERNAME}"
 
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}

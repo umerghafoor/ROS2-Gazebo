@@ -20,6 +20,19 @@ log "  UBUNTU_VERSION = ${UBUNTU_VERSION}"
 
 cd "${PROJECT_ROOT}"
 
+# Resolve UID/GID for the in-container `ros` user.
+# If running as root (e.g. via sudo), id -u/-g return 0 — that collides with
+# the root group inside the image. Fall back to SUDO_UID/SUDO_GID when
+# available, otherwise default to 1000:1000.
+BUILD_UID="$(id -u)"
+BUILD_GID="$(id -g)"
+if [ "${BUILD_UID}" = "0" ]; then
+    BUILD_UID="${SUDO_UID:-1000}"
+    BUILD_GID="${SUDO_GID:-1000}"
+    warn "Running as root — using UID:GID ${BUILD_UID}:${BUILD_GID} for the container user."
+    warn "  (Run without sudo once you've added yourself to the 'docker' group.)"
+fi
+
 # Prefer BuildKit if the buildx plugin is installed (faster, better cache).
 # Some distros (e.g. Ubuntu's docker.io package) ship Docker without buildx —
 # fall back to the legacy builder in that case so the build still works.
@@ -39,8 +52,8 @@ docker build \
     --build-arg "ROS_DISTRO=${ROS_DISTRO}" \
     --build-arg "GZ_DISTRO=${GZ_DISTRO}" \
     --build-arg "UBUNTU_VERSION=${UBUNTU_VERSION}" \
-    --build-arg "USER_UID=$(id -u)" \
-    --build-arg "USER_GID=$(id -g)" \
+    --build-arg "USER_UID=${BUILD_UID}" \
+    --build-arg "USER_GID=${BUILD_GID}" \
     "$@" \
     .
 
