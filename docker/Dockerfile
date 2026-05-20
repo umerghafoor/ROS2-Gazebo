@@ -73,6 +73,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1-mesa-dri \
         x11-apps \
         x11-utils \
+        qt6-base-dev \
+        qt6-tools-dev \
+        qt6-tools-dev-tools \
+        libqt6opengl6-dev \
+        libqt6svg6-dev \
     && rosdep init \
     && rm -rf /var/lib/apt/lists/*
 
